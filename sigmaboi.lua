@@ -7,6 +7,7 @@ local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
 local VirtualInputManager = game:GetService("VirtualInputManager")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
 local LocalPlayer = Players.LocalPlayer
 
 local playerCache = {}
@@ -17,9 +18,16 @@ local Flying = false
 local FlyBodyVelocity = nil
 local FlyConnection = nil
 
--- Store original gun functions for restoration
-local originalGunFunctions = {}
-local hookedGuns = {}
+-- No Recoil variables
+local RecoilHandler = nil
+local originalRecoilNew = nil
+local originalRecoilFromRecoilInfo = nil
+local noRecoilActive = false
+
+-- Inventory Viewer State
+local inventoryViewerActive = false
+local currentInventoryGui = nil
+local inventoryUpdateConnection = nil
 
 local v13 = {
     Enabled = false, TargetPart = "Head",
@@ -27,13 +35,36 @@ local v13 = {
     MaxDistance = 500,
 }
 
-local ESPOptions = { Enabled = false, Name = false, Distance = false, Box = false, Chams = false, Tracer = false }
+local ESPOptions = { 
+    Enabled = false, 
+    Name = false, 
+    Distance = false, 
+    Box = false, 
+    Chams = false, 
+    Tracer = false,
+    Items = false,
+    Ores = false,
+    Crates = false,
+    Backpacks = false,
+    Airdrop = false,
+    ViewmodelChams = false,
+    ItemName = false  -- Changed from Inventory to ItemName
+}
+
 local ESPColors = { 
     Name = Color3.fromRGB(255,255,255), 
     Distance = Color3.fromRGB(255,255,255),
     Box = Color3.fromRGB(255,0,0),
-    Tracer = Color3.fromRGB(0,255,0)
+    Tracer = Color3.fromRGB(0,255,0),
+    Items = Color3.fromRGB(0,255,255),
+    Ores = Color3.fromRGB(255,255,0),
+    Crates = Color3.fromRGB(255,128,0),
+    Backpacks = Color3.fromRGB(255,0,255),
+    Airdrop = Color3.fromRGB(0,255,128),
+    Viewmodel = Color3.fromRGB(0,255,0),
+    ItemName = Color3.fromRGB(255,255,0)  -- Yellow color for item names
 }
+
 local SpeedSettings = { Enabled = false, Value = 30 }
 local AutoFireSettings = { Enabled = false }
 local FOVSettings = { Enabled = false, Value = 70 }
@@ -44,119 +75,339 @@ local NoRecoilSettings = { Enabled = false }
 local InfiniteJumpSettings = { Enabled = false }
 local FullbrightSettings = { Enabled = false }
 local RapidFireSettings = { Enabled = false }
-local InstantReloadSettings = { Enabled = false }
-local InfiniteAmmoSettings = { Enabled = false }
+
+-- ============ NO RECOIL SYSTEM ============
+local function setupNoRecoil()
+    if not NoRecoilSettings.Enabled then
+        if originalRecoilNew and RecoilHandler then
+            RecoilHandler.new = originalRecoilNew
+            RecoilHandler.fromRecoilInfo = originalRecoilFromRecoilInfo
+        end
+        return
+    end
+    
+    if noRecoilActive then return end
+    
+    pcall(function()
+        RecoilHandler = require(ReplicatedStorage:WaitForChild("Gun").Scripts.RecoilHandler)
+        
+        if not originalRecoilNew then
+            originalRecoilNew = RecoilHandler.new
+            originalRecoilFromRecoilInfo = RecoilHandler.fromRecoilInfo
+        end
+        
+        RecoilHandler.__index = RecoilHandler
+        
+        RecoilHandler.new = function(xFunction, yFunction, startingPoint, step, degreesPerUnit)
+            local recoilFunctionInstance = setmetatable({}, RecoilHandler)
+            recoilFunctionInstance.XFunction = xFunction
+            recoilFunctionInstance.YFunction = yFunction
+            recoilFunctionInstance.StartingPoint = startingPoint or 0
+            recoilFunctionInstance.Step = step or 1
+            recoilFunctionInstance.DegreesPerUnit = degreesPerUnit or 5
+            recoilFunctionInstance.RadiansPerUnit = math.rad(recoilFunctionInstance.DegreesPerUnit)
+            recoilFunctionInstance.RecoilMultiplier = 0
+            recoilFunctionInstance:reset()
+            return recoilFunctionInstance
+        end
+        
+        RecoilHandler.fromRecoilInfo = function(recoilInfo)
+            return RecoilHandler.new(
+                recoilInfo.XFunction,
+                recoilInfo.YFunction,
+                recoilInfo.StartingPoint,
+                recoilInfo.Step,
+                recoilInfo.DegreesPerUnit
+            )
+        end
+        
+        RecoilHandler.setRecoilMultiplier = function(recoilInfo, multiplier)
+            recoilInfo.RecoilMultiplier = multiplier
+        end
+        
+        RecoilHandler.reset = function(recoilInstance)
+            recoilInstance.CurrentStep = recoilInstance.StartingPoint
+            recoilInstance.PreviousX = recoilInstance.XFunction(recoilInstance.CurrentStep)
+            recoilInstance.PreviousY = recoilInstance.YFunction(recoilInstance.CurrentStep)
+        end
+        
+        RecoilHandler.getFinalRecoilMultiplier = function(recoilInfo)
+            return 0
+        end
+        
+        RecoilHandler.nextStep = function(recoilInstance)
+            recoilInstance.CurrentStep = recoilInstance.CurrentStep + recoilInstance.Step
+            local currentX = recoilInstance.XFunction(recoilInstance.CurrentStep)
+            local currentY = recoilInstance.YFunction(recoilInstance.CurrentStep)
+            recoilInstance.PreviousX = currentX
+            recoilInstance.PreviousY = currentY
+        end
+        
+        noRecoilActive = true
+    end)
+end
 
 -- Cache players
 for _, p in ipairs(Players:GetPlayers()) do if p ~= LocalPlayer then playerCache[p] = true end end
 Players.PlayerAdded:Connect(function(p) if p ~= LocalPlayer then playerCache[p] = true end end)
 Players.PlayerRemoving:Connect(function(p) playerCache[p] = nil end)
 
--- ============ GUN SYSTEM INTEGRATION ============
-local function getCurrentGun()
-    if not cachedChar then return nil end
-    local tool = cachedChar:FindFirstChildWhichIsA("Tool")
-    if not tool then return nil end
-    return tool
-end
-
-local function hookGun(gunTool)
-    if hookedGuns[gunTool] then return end
-    
-    -- Find the gun instance in memory
-    local gunInstance = nil
-    for _, v in pairs(getgc(true)) do
-        if type(v) == "table" and rawget(v, "Tool") == gunTool and rawget(v, "IsEquipped") ~= nil then
-            gunInstance = v
-            break
-        end
-    end
-    
-    if not gunInstance then return end
-    
-    hookedGuns[gunTool] = gunInstance
-    originalGunFunctions[gunTool] = {}
-    
-    -- Infinite Ammo
-    if InfiniteAmmoSettings.Enabled then
-        originalGunFunctions[gunTool].CurrentAmmo = gunInstance.CurrentAmmo
-        originalGunFunctions[gunTool].MaxAmmo = gunInstance.MaxAmmo
-        originalGunFunctions[gunTool].MagAmmo = gunInstance.MagAmmo
-        
-        gunInstance.CurrentAmmo = 999
-        gunInstance.MaxAmmo = 999
-        gunInstance.MagAmmo = 999
-    end
-    
-    -- No Recoil
-    if NoRecoilSettings.Enabled and gunInstance.RecoilHandler then
-        originalGunFunctions[gunTool].RecoilNextStep = gunInstance.RecoilHandler.nextStep
-        gunInstance.RecoilHandler.nextStep = function() end
-        gunInstance.RecoilHandler.RecoilMultiplier = 0
-    end
-    
-    -- Instant Reload
-    if InstantReloadSettings.Enabled then
-        originalGunFunctions[gunTool].Reload = gunInstance.reload
-        gunInstance.reload = function(self)
-            self.CurrentAmmo = self.MaxAmmo
-            return true
-        end
-    end
-end
-
-local function unhookGun(gunTool)
-    local gunInstance = hookedGuns[gunTool]
-    if not gunInstance then return end
-    
-    if originalGunFunctions[gunTool] then
-        if originalGunFunctions[gunTool].RecoilNextStep and gunInstance.RecoilHandler then
-            gunInstance.RecoilHandler.nextStep = originalGunFunctions[gunTool].RecoilNextStep
-        end
-        if originalGunFunctions[gunTool].Reload then
-            gunInstance.reload = originalGunFunctions[gunTool].Reload
-        end
-    end
-    
-    hookedGuns[gunTool] = nil
-    originalGunFunctions[gunTool] = nil
-end
-
-local function updateGunMods()
-    for gunTool, gunInstance in pairs(hookedGuns) do
-        if gunTool and gunTool.Parent then
-            -- Update Infinite Ammo
-            if InfiniteAmmoSettings.Enabled then
-                gunInstance.CurrentAmmo = 999
-                gunInstance.MaxAmmo = 999
-                gunInstance.MagAmmo = 999
-            elseif originalGunFunctions[gunTool] then
-                gunInstance.CurrentAmmo = originalGunFunctions[gunTool].CurrentAmmo or gunInstance.CurrentAmmo
-                gunInstance.MaxAmmo = originalGunFunctions[gunTool].MaxAmmo or gunInstance.MaxAmmo
-                gunInstance.MagAmmo = originalGunFunctions[gunTool].MagAmmo or gunInstance.MagAmmo
+-- ============ VIEWMODEL CHAMS ============
+local viewmodelChamsInstance = nil
+local function updateViewmodelChams()
+    if ESPOptions.ViewmodelChams then
+        local char = LocalPlayer.Character
+        if char then
+            local viewmodel = char:FindFirstChild("ViewModel")
+            if viewmodel then
+                if not viewmodelChamsInstance then
+                    viewmodelChamsInstance = Instance.new("Highlight")
+                    viewmodelChamsInstance.FillColor = ESPColors.Viewmodel
+                    viewmodelChamsInstance.FillTransparency = 0.3
+                    viewmodelChamsInstance.OutlineTransparency = 0.5
+                end
+                viewmodelChamsInstance.Adornee = viewmodel
+                viewmodelChamsInstance.Parent = viewmodel
             end
-            
-            -- Update No Recoil
-            if NoRecoilSettings.Enabled and gunInstance.RecoilHandler then
-                gunInstance.RecoilHandler.nextStep = function() end
-                gunInstance.RecoilHandler.RecoilMultiplier = 0
-            elseif originalGunFunctions[gunTool] and originalGunFunctions[gunTool].RecoilNextStep and gunInstance.RecoilHandler then
-                gunInstance.RecoilHandler.nextStep = originalGunFunctions[gunTool].RecoilNextStep
+        end
+    else
+        if viewmodelChamsInstance then
+            viewmodelChamsInstance:Destroy()
+            viewmodelChamsInstance = nil
+        end
+    end
+end
+
+-- ============ GET PLAYER CURRENT WEAPON ============
+local function getPlayerCurrentWeapon(player)
+    if not player or not player.Character then return nil end
+    
+    local char = player.Character
+    for _, child in pairs(char:GetChildren()) do
+        if child:IsA("Tool") and (child:FindFirstChild("Handle") or child:FindFirstChild("PrimaryPart")) then
+            return child.Name
+        end
+    end
+    return nil
+end
+
+-- ============ GET PLAYER INVENTORY ITEMS ============
+local function getPlayerInventoryItems(player)
+    if not player then return {} end
+    
+    local items = {}
+    local seenItems = {}
+    
+    if player.Character then
+        for _, tool in pairs(player.Character:GetChildren()) do
+            if tool:IsA("Tool") and not seenItems[tool.Name] then
+                seenItems[tool.Name] = true
+                table.insert(items, tool.Name)
             end
+        end
+    end
+    
+    local backpack = player:FindFirstChild("Backpack")
+    if backpack then
+        for _, tool in pairs(backpack:GetChildren()) do
+            if tool:IsA("Tool") and not seenItems[tool.Name] then
+                seenItems[tool.Name] = true
+                table.insert(items, tool.Name)
+            end
+        end
+    end
+    
+    return items
+end
+
+-- ============ INVENTORY VIEWER GUI ============
+local function getClosestPlayerToCenter()
+    local cam = workspace.CurrentCamera
+    if not cam then return nil end
+    local viewportCenter = cam.ViewportSize / 2
+    local closest = nil
+    local closestDist = math.huge
+    
+    for plr in next, playerCache do
+        local ch = plr.Character
+        if ch then
+            local hrp = ch:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local screenPos, onScreen = cam:WorldToViewportPoint(hrp.Position)
+                if onScreen then
+                    local distToCenter = (Vector2.new(screenPos.X, screenPos.Y) - viewportCenter).Magnitude
+                    if distToCenter < closestDist then
+                        closestDist = distToCenter
+                        closest = plr
+                    end
+                end
+            end
+        end
+    end
+    return closest
+end
+
+local function updateInventoryViewerDisplay(player, scrollFrame, mainFrame)
+    if not player or not scrollFrame or not mainFrame then return end
+    
+    for _, child in pairs(scrollFrame:GetChildren()) do
+        if child:IsA("TextButton") or child:IsA("Frame") then
+            child:Destroy()
+        end
+    end
+    
+    local items = getPlayerInventoryItems(player)
+    local currentWeapon = getPlayerCurrentWeapon(player)
+    
+    local nameLabel = mainFrame:FindFirstChild("NameLabel")
+    if nameLabel then
+        if currentWeapon then
+            nameLabel.Text = player.DisplayName .. " 🔫 " .. currentWeapon
         else
-            unhookGun(gunTool)
+            nameLabel.Text = player.DisplayName .. " (No Weapon)"
         end
     end
     
-    -- Hook new gun if equipped
-    local currentGun = getCurrentGun()
-    if currentGun and not hookedGuns[currentGun] then
-        hookGun(currentGun)
+    local canvasWidth = #items * 55
+    scrollFrame.CanvasSize = UDim2.new(0, math.max(canvasWidth, 350), 0, 30)
+    
+    for i, itemName in ipairs(items) do
+        local isCurrentWeapon = (itemName == currentWeapon)
+        
+        local itemBtn = Instance.new("TextButton")
+        itemBtn.Size = UDim2.new(0, 50, 0, 30)
+        itemBtn.Position = UDim2.new(0, (i-1) * 55, 0, 0)
+        itemBtn.BackgroundColor3 = isCurrentWeapon and Color3.fromRGB(0, 150, 0) or Color3.fromRGB(40, 40, 45)
+        itemBtn.BackgroundTransparency = 0.3
+        itemBtn.Text = itemName
+        itemBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        itemBtn.Font = Enum.Font.Gotham
+        itemBtn.TextSize = 10
+        itemBtn.TextWrapped = true
+        itemBtn.Parent = scrollFrame
+        
+        local btnCorner = Instance.new("UICorner")
+        btnCorner.CornerRadius = UDim.new(0, 6)
+        btnCorner.Parent = itemBtn
     end
+end
+
+local function toggleInventoryViewer()
+    if inventoryViewerActive then
+        if currentInventoryGui then
+            currentInventoryGui:Destroy()
+            currentInventoryGui = nil
+        end
+        if inventoryUpdateConnection then
+            inventoryUpdateConnection:Disconnect()
+            inventoryUpdateConnection = nil
+        end
+        inventoryViewerActive = false
+        return
+    end
+    
+    local target = getClosestPlayerToCenter()
+    if not target then
+        Rayfield:Notify({
+            Title = "Inventory Viewer",
+            Content = "No player found near center of screen!",
+            Duration = 2,
+        })
+        return
+    end
+    
+    inventoryViewerActive = true
+    
+    if currentInventoryGui then currentInventoryGui:Destroy() end
+    
+    local invGui = Instance.new("ScreenGui")
+    invGui.Name = "PlayerInventoryViewer"
+    invGui.Parent = game.CoreGui
+    invGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    currentInventoryGui = invGui
+    
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Size = UDim2.new(0, 450, 0, 65)
+    mainFrame.Position = UDim2.new(0.5, -225, 0, 10)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    mainFrame.BorderSizePixel = 0
+    mainFrame.BackgroundTransparency = 0.15
+    mainFrame.Parent = invGui
+    
+    local mainCorner = Instance.new("UICorner")
+    mainCorner.CornerRadius = UDim.new(0, 12)
+    mainCorner.Parent = mainFrame
+    
+    local glow = Instance.new("Frame")
+    glow.Size = UDim2.new(1, 0, 1, 0)
+    glow.Position = UDim2.new(0, 0, 0, 0)
+    glow.BackgroundColor3 = Color3.fromRGB(0, 150, 255)
+    glow.BackgroundTransparency = 0.8
+    glow.BorderSizePixel = 0
+    glow.Parent = mainFrame
+    
+    local glowCorner = Instance.new("UICorner")
+    glowCorner.CornerRadius = UDim.new(0, 12)
+    glowCorner.Parent = glow
+    
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Name = "NameLabel"
+    nameLabel.Size = UDim2.new(1, -50, 0, 25)
+    nameLabel.Position = UDim2.new(0, 10, 0, 5)
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.Text = target.DisplayName
+    nameLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextSize = 14
+    nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+    nameLabel.Parent = mainFrame
+    
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 25, 0, 25)
+    closeBtn.Position = UDim2.new(1, -30, 0, 5)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+    closeBtn.BackgroundTransparency = 0.5
+    closeBtn.Text = "X"
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 14
+    closeBtn.Parent = mainFrame
+    
+    local closeCorner = Instance.new("UICorner")
+    closeCorner.CornerRadius = UDim.new(0, 6)
+    closeCorner.Parent = closeBtn
+    
+    local scrollFrame = Instance.new("ScrollingFrame")
+    scrollFrame.Size = UDim2.new(1, -20, 0, 30)
+    scrollFrame.Position = UDim2.new(0, 10, 0, 32)
+    scrollFrame.BackgroundTransparency = 1
+    scrollFrame.ScrollBarThickness = 3
+    scrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scrollFrame.Parent = mainFrame
+    
+    updateInventoryViewerDisplay(target, scrollFrame, mainFrame)
+    
+    inventoryUpdateConnection = game:GetService("RunService").Stepped:Connect(function()
+        if invGui and invGui.Parent and inventoryViewerActive then
+            local currentTarget = getClosestPlayerToCenter()
+            if currentTarget and currentTarget == target then
+                updateInventoryViewerDisplay(target, scrollFrame, mainFrame)
+            elseif currentTarget then
+                target = currentTarget
+                updateInventoryViewerDisplay(target, scrollFrame, mainFrame)
+            end
+        elseif inventoryViewerActive then
+            toggleInventoryViewer()
+        end
+    end)
+    
+    closeBtn.MouseButton1Click:Connect(function()
+        toggleInventoryViewer()
+    end)
 end
 
 -- ============ SILENT AIM ============
-local function getClosestPlayer()
+local function getClosestPlayerForAim()
     local cam = workspace.CurrentCamera
     if not cam then return nil end
     local mousePos = UserInputService:GetMouseLocation()
@@ -221,21 +472,56 @@ local function setFullbright(enabled)
     end
 end
 
--- ============ ESP SYSTEM (Optimized) ============
+-- ============ ESP SYSTEM ============
 local espObjects = {}
 local lastESPCleanup = 0
+
+local function isPlayerDead(character)
+    local hum = character and character:FindFirstChild("Humanoid")
+    return not hum or hum.Health <= 0
+end
+
+local function clearAllESP()
+    for obj, data in pairs(espObjects) do
+        for _, drawingObj in pairs(data) do
+            pcall(function() 
+                if drawingObj then
+                    if drawingObj.Remove then drawingObj:Remove() 
+                    elseif drawingObj.Destroy then drawingObj:Destroy() 
+                    end
+                end
+            end)
+        end
+    end
+    espObjects = {}
+end
 
 local function cleanupESP()
     local now = tick()
     if now - lastESPCleanup < 0.5 then return end
     lastESPCleanup = now
     
-    for plr, objects in pairs(espObjects) do
-        if not playerCache[plr] or not plr.Parent then
-            for _, obj in pairs(objects) do
-                pcall(function() if obj.Remove then obj:Remove() else obj:Destroy() end end)
+    for obj, data in pairs(espObjects) do
+        local valid = false
+        if obj and obj.Parent then
+            if obj:IsA("Player") then
+                valid = true
+            elseif obj:IsA("BasePart") or obj:IsA("Model") or obj:IsA("MeshPart") then
+                if obj.Parent then valid = true end
             end
-            espObjects[plr] = nil
+        end
+        
+        if not valid then
+            for _, drawingObj in pairs(data) do
+                pcall(function() 
+                    if drawingObj then
+                        if drawingObj.Remove then drawingObj:Remove() 
+                        elseif drawingObj.Destroy then drawingObj:Destroy() 
+                        end
+                    end
+                end)
+            end
+            espObjects[obj] = nil
         end
     end
 end
@@ -244,12 +530,7 @@ local function updateESP()
     cleanupESP()
     
     if not ESPOptions.Enabled then
-        for _, objects in pairs(espObjects) do
-            for _, obj in pairs(objects) do
-                pcall(function() if obj.Remove then obj:Remove() else obj:Destroy() end end)
-            end
-        end
-        for k in pairs(espObjects) do espObjects[k] = nil end
+        clearAllESP()
         return
     end
     
@@ -259,106 +540,325 @@ local function updateESP()
     
     for plr in next, playerCache do
         local ch = plr.Character
-        local shouldSkip = false
+        local isDead = isPlayerDead(ch)
         
-        if not ch then 
-            shouldSkip = true
-        else
-            local hrp = ch:FindFirstChild("HumanoidRootPart")
-            local hum = ch:FindFirstChild("Humanoid")
-            if not hrp or not hum or hum.Health <= 0 then
-                shouldSkip = true
-            end
-        end
-        
-        if shouldSkip then
+        if not ch or isDead then
             if espObjects[plr] then
                 for _, obj in pairs(espObjects[plr]) do
-                    pcall(function() if obj.Visible ~= nil then obj.Visible = false end end)
+                    pcall(function() if obj and obj.Visible ~= nil then obj.Visible = false end end)
                 end
             end
         else
             local hrp = ch:FindFirstChild("HumanoidRootPart")
-            local hum = ch:FindFirstChild("Humanoid")
-            local screenPos, onScreen = cam:WorldToViewportPoint(hrp.Position)
-            local dist = myRoot and (myRoot.Position - hrp.Position).Magnitude or 0
-            
-            if not espObjects[plr] then espObjects[plr] = {} end
-            
-            -- Name ESP
-            if ESPOptions.Name then
-                if not espObjects[plr].Name then
-                    local text = Drawing.new("Text")
-                    text.Size = 14
-                    text.Center = true
-                    text.Outline = true
-                    text.Color = ESPColors.Name
-                    espObjects[plr].Name = text
+            if hrp then
+                local screenPos, onScreen = cam:WorldToViewportPoint(hrp.Position)
+                local dist = myRoot and (myRoot.Position - hrp.Position).Magnitude or 0
+                local currentWeapon = getPlayerCurrentWeapon(plr)
+                
+                if not espObjects[plr] then espObjects[plr] = {} end
+                
+                -- Player Name ESP (top)
+                if ESPOptions.Name and onScreen then
+                    if not espObjects[plr].Name then
+                        local text = Drawing.new("Text")
+                        text.Size = 14
+                        text.Center = true
+                        text.Outline = true
+                        text.Color = ESPColors.Name
+                        espObjects[plr].Name = text
+                    end
+                    if espObjects[plr].Name then
+                        espObjects[plr].Name.Visible = true
+                        espObjects[plr].Name.Position = Vector2.new(screenPos.X, screenPos.Y - 55)
+                        espObjects[plr].Name.Text = plr.DisplayName
+                    end
+                elseif espObjects[plr] and espObjects[plr].Name then
+                    espObjects[plr].Name.Visible = false
                 end
-                local nameObj = espObjects[plr].Name
-                nameObj.Visible = onScreen
-                if onScreen then
-                    nameObj.Position = Vector2.new(screenPos.X, screenPos.Y - 40)
-                    nameObj.Text = plr.DisplayName
+                
+                -- Distance ESP
+                if ESPOptions.Distance and onScreen then
+                    if not espObjects[plr].Dist then
+                        local text = Drawing.new("Text")
+                        text.Size = 12
+                        text.Center = true
+                        text.Outline = true
+                        text.Color = ESPColors.Distance
+                        espObjects[plr].Dist = text
+                    end
+                    if espObjects[plr].Dist then
+                        espObjects[plr].Dist.Visible = true
+                        espObjects[plr].Dist.Position = Vector2.new(screenPos.X, screenPos.Y - 40)
+                        espObjects[plr].Dist.Text = math.floor(dist) .. "m"
+                    end
+                elseif espObjects[plr] and espObjects[plr].Dist then
+                    espObjects[plr].Dist.Visible = false
                 end
-            elseif espObjects[plr].Name then
-                espObjects[plr].Name.Visible = false
+                
+                -- Item Name ESP (below the player - shows current weapon)
+                if ESPOptions.ItemName and onScreen and currentWeapon then
+                    if not espObjects[plr].ItemName then
+                        local text = Drawing.new("Text")
+                        text.Size = 12
+                        text.Center = true
+                        text.Outline = true
+                        text.Color = ESPColors.ItemName
+                        espObjects[plr].ItemName = text
+                    end
+                    if espObjects[plr].ItemName then
+                        espObjects[plr].ItemName.Visible = true
+                        espObjects[plr].ItemName.Position = Vector2.new(screenPos.X, screenPos.Y + 15)
+                        espObjects[plr].ItemName.Text = "📦 " .. currentWeapon
+                    end
+                elseif espObjects[plr] and espObjects[plr].ItemName then
+                    espObjects[plr].ItemName.Visible = false
+                end
+                
+                -- Box ESP
+                if ESPOptions.Box and onScreen then
+                    if not espObjects[plr].Box then
+                        local box = Drawing.new("Square")
+                        box.Thickness = 1
+                        box.Transparency = 0.5
+                        box.Color = ESPColors.Box
+                        box.Filled = false
+                        espObjects[plr].Box = box
+                    end
+                    if espObjects[plr].Box then
+                        local size = 100 / screenPos.Z
+                        espObjects[plr].Box.Size = Vector2.new(50 * size, 100 * size)
+                        espObjects[plr].Box.Position = Vector2.new(screenPos.X - espObjects[plr].Box.Size.X / 2, screenPos.Y - espObjects[plr].Box.Size.Y / 2)
+                        espObjects[plr].Box.Visible = true
+                    end
+                elseif espObjects[plr] and espObjects[plr].Box then
+                    espObjects[plr].Box.Visible = false
+                end
+                
+                -- Tracer ESP
+                if ESPOptions.Tracer and onScreen then
+                    if not espObjects[plr].Tracer then
+                        local tracer = Drawing.new("Line")
+                        tracer.Thickness = 1
+                        tracer.Color = ESPColors.Tracer
+                        espObjects[plr].Tracer = tracer
+                    end
+                    if espObjects[plr].Tracer then
+                        local center = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
+                        espObjects[plr].Tracer.From = center
+                        espObjects[plr].Tracer.To = Vector2.new(screenPos.X, screenPos.Y)
+                        espObjects[plr].Tracer.Visible = true
+                    end
+                elseif espObjects[plr] and espObjects[plr].Tracer then
+                    espObjects[plr].Tracer.Visible = false
+                end
             end
-            
-            -- Distance ESP
-            if ESPOptions.Distance then
-                if not espObjects[plr].Dist then
-                    local text = Drawing.new("Text")
-                    text.Size = 12
-                    text.Center = true
-                    text.Outline = true
-                    text.Color = ESPColors.Distance
-                    espObjects[plr].Dist = text
+        end
+    end
+    
+    -- BackpackItems ESP
+    if ESPOptions.Items then
+        local backpackItems = ReplicatedStorage:FindFirstChild("BackpackItems")
+        if backpackItems then
+            for _, item in pairs(backpackItems:GetChildren()) do
+                if item:IsA("Model") then
+                    local primaryPart = item.PrimaryPart or item:FindFirstChildWhichIsA("BasePart")
+                    if primaryPart and primaryPart.Parent then
+                        local screenPos, onScreen = cam:WorldToViewportPoint(primaryPart.Position)
+                        if onScreen then
+                            if not espObjects[item] then espObjects[item] = {} end
+                            if not espObjects[item].Name then
+                                local text = Drawing.new("Text")
+                                text.Size = 12
+                                text.Center = true
+                                text.Outline = true
+                                text.Color = ESPColors.Items
+                                espObjects[item].Name = text
+                            end
+                            if espObjects[item].Name then
+                                espObjects[item].Name.Visible = true
+                                espObjects[item].Name.Position = Vector2.new(screenPos.X, screenPos.Y - 20)
+                                espObjects[item].Name.Text = item.Name
+                            end
+                        elseif espObjects[item] and espObjects[item].Name then
+                            espObjects[item].Name.Visible = false
+                        end
+                    end
                 end
-                local distObj = espObjects[plr].Dist
-                distObj.Visible = onScreen
-                if onScreen then
-                    distObj.Position = Vector2.new(screenPos.X, screenPos.Y - 25)
-                    distObj.Text = math.floor(dist) .. "m"
-                end
-            elseif espObjects[plr].Dist then
-                espObjects[plr].Dist.Visible = false
             end
-            
-            -- Box ESP
-            if ESPOptions.Box and onScreen then
-                if not espObjects[plr].Box then
-                    local box = Drawing.new("Square")
-                    box.Thickness = 1
-                    box.Transparency = 0.5
-                    box.Color = ESPColors.Box
-                    box.Filled = false
-                    espObjects[plr].Box = box
-                end
-                local boxObj = espObjects[plr].Box
-                local size = 100 / screenPos.Z
-                boxObj.Size = Vector2.new(50 * size, 100 * size)
-                boxObj.Position = Vector2.new(screenPos.X - boxObj.Size.X / 2, screenPos.Y - boxObj.Size.Y / 2)
-                boxObj.Visible = true
-            elseif espObjects[plr] and espObjects[plr].Box then
-                espObjects[plr].Box.Visible = false
+        end
+    else
+        for obj, data in pairs(espObjects) do
+            if obj and (obj:IsDescendantOf(ReplicatedStorage) and obj.Parent == ReplicatedStorage:FindFirstChild("BackpackItems")) then
+                if data.Name then data.Name.Visible = false end
             end
-            
-            -- Tracer ESP
-            if ESPOptions.Tracer and onScreen and cam then
-                if not espObjects[plr].Tracer then
-                    local tracer = Drawing.new("Line")
-                    tracer.Thickness = 1
-                    tracer.Color = ESPColors.Tracer
-                    espObjects[plr].Tracer = tracer
+        end
+    end
+    
+    -- Ores ESP
+    if ESPOptions.Ores then
+        local ores = Workspace:FindFirstChild("ores")
+        if ores then
+            for _, ore in pairs(ores:GetChildren()) do
+                if ore:IsA("MeshPart") and ore.Parent then
+                    local screenPos, onScreen = cam:WorldToViewportPoint(ore.Position)
+                    if onScreen then
+                        if not espObjects[ore] then espObjects[ore] = {} end
+                        if not espObjects[ore].Name then
+                            local text = Drawing.new("Text")
+                            text.Size = 12
+                            text.Center = true
+                            text.Outline = true
+                            text.Color = ESPColors.Ores
+                            espObjects[ore].Name = text
+                        end
+                        if espObjects[ore].Name then
+                            espObjects[ore].Name.Visible = true
+                            espObjects[ore].Name.Position = Vector2.new(screenPos.X, screenPos.Y - 20)
+                            espObjects[ore].Name.Text = ore.Name
+                        end
+                    elseif espObjects[ore] and espObjects[ore].Name then
+                        espObjects[ore].Name.Visible = false
+                    end
                 end
-                local tracerObj = espObjects[plr].Tracer
-                local center = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
-                tracerObj.From = center
-                tracerObj.To = Vector2.new(screenPos.X, screenPos.Y)
-                tracerObj.Visible = true
-            elseif espObjects[plr] and espObjects[plr].Tracer then
-                espObjects[plr].Tracer.Visible = false
+            end
+        end
+    else
+        for obj, data in pairs(espObjects) do
+            if obj and obj:IsDescendantOf(Workspace) and obj.Parent == Workspace:FindFirstChild("ores") then
+                if data.Name then data.Name.Visible = false end
+            end
+        end
+    end
+    
+    -- Crates ESP
+    if ESPOptions.Crates then
+        local crates = Workspace:FindFirstChild("Crates")
+        if crates then
+            for _, crate in pairs(crates:GetChildren()) do
+                if crate:IsA("Model") then
+                    local primaryPart = crate.PrimaryPart or crate:FindFirstChildWhichIsA("BasePart")
+                    if primaryPart and primaryPart.Parent then
+                        local screenPos, onScreen = cam:WorldToViewportPoint(primaryPart.Position)
+                        if onScreen then
+                            if not espObjects[crate] then espObjects[crate] = {} end
+                            if not espObjects[crate].Name then
+                                local text = Drawing.new("Text")
+                                text.Size = 12
+                                text.Center = true
+                                text.Outline = true
+                                text.Color = ESPColors.Crates
+                                espObjects[crate].Name = text
+                            end
+                            if espObjects[crate].Name then
+                                espObjects[crate].Name.Visible = true
+                                espObjects[crate].Name.Position = Vector2.new(screenPos.X, screenPos.Y - 20)
+                                espObjects[crate].Name.Text = crate.Name
+                            end
+                        elseif espObjects[crate] and espObjects[crate].Name then
+                            espObjects[crate].Name.Visible = false
+                        end
+                    end
+                end
+            end
+        end
+    else
+        for obj, data in pairs(espObjects) do
+            if obj and obj:IsDescendantOf(Workspace) and obj.Parent == Workspace:FindFirstChild("Crates") then
+                if data.Name then data.Name.Visible = false end
+            end
+        end
+    end
+    
+    -- DeathBackpacks ESP
+    if ESPOptions.Backpacks then
+        local deathBackpacks = Workspace:FindFirstChild("DeathBackpacks")
+        if deathBackpacks then
+            for _, backpack in pairs(deathBackpacks:GetChildren()) do
+                if backpack:IsA("Model") then
+                    local primaryPart = backpack.PrimaryPart or backpack:FindFirstChildWhichIsA("BasePart")
+                    if primaryPart and primaryPart.Parent then
+                        local screenPos, onScreen = cam:WorldToViewportPoint(primaryPart.Position)
+                        if onScreen then
+                            if not espObjects[backpack] then espObjects[backpack] = {} end
+                            if not espObjects[backpack].Name then
+                                local text = Drawing.new("Text")
+                                text.Size = 12
+                                text.Center = true
+                                text.Outline = true
+                                text.Color = ESPColors.Backpacks
+                                espObjects[backpack].Name = text
+                            end
+                            if espObjects[backpack].Name then
+                                espObjects[backpack].Name.Visible = true
+                                espObjects[backpack].Name.Position = Vector2.new(screenPos.X, screenPos.Y - 20)
+                                espObjects[backpack].Name.Text = "Death Backpack"
+                            end
+                        elseif espObjects[backpack] and espObjects[backpack].Name then
+                            espObjects[backpack].Name.Visible = false
+                        end
+                    end
+                end
+            end
+        end
+    else
+        for obj, data in pairs(espObjects) do
+            if obj and obj:IsDescendantOf(Workspace) and obj.Parent == Workspace:FindFirstChild("DeathBackpacks") then
+                if data.Name then data.Name.Visible = false end
+            end
+        end
+    end
+    
+    -- Airdrop ESP
+    if ESPOptions.Airdrop then
+        local airdrop = Workspace:FindFirstChild("Airdrop")
+        if airdrop then
+            local airdropModel = airdrop:FindFirstChild("AirdropModel")
+            if airdropModel and airdropModel:IsA("Model") then
+                local primaryPart = airdropModel.PrimaryPart or airdropModel:FindFirstChildWhichIsA("BasePart")
+                if primaryPart and primaryPart.Parent then
+                    local screenPos, onScreen = cam:WorldToViewportPoint(primaryPart.Position)
+                    if onScreen then
+                        if not espObjects[airdropModel] then espObjects[airdropModel] = {} end
+                        if not espObjects[airdropModel].Name then
+                            local text = Drawing.new("Text")
+                            text.Size = 14
+                            text.Center = true
+                            text.Outline = true
+                            text.Color = ESPColors.Airdrop
+                            espObjects[airdropModel].Name = text
+                        end
+                        if espObjects[airdropModel].Name then
+                            espObjects[airdropModel].Name.Visible = true
+                            espObjects[airdropModel].Name.Position = Vector2.new(screenPos.X, screenPos.Y - 30)
+                            espObjects[airdropModel].Name.Text = "AIRDROP"
+                        end
+                        
+                        if not espObjects[airdropModel].Box then
+                            local box = Drawing.new("Square")
+                            box.Thickness = 2
+                            box.Transparency = 0.5
+                            box.Color = ESPColors.Airdrop
+                            box.Filled = false
+                            espObjects[airdropModel].Box = box
+                        end
+                        if espObjects[airdropModel].Box then
+                            local size = 150 / screenPos.Z
+                            espObjects[airdropModel].Box.Size = Vector2.new(60 * size, 60 * size)
+                            espObjects[airdropModel].Box.Position = Vector2.new(screenPos.X - espObjects[airdropModel].Box.Size.X / 2, screenPos.Y - espObjects[airdropModel].Box.Size.Y / 2)
+                            espObjects[airdropModel].Box.Visible = true
+                        end
+                    elseif espObjects[airdropModel] then
+                        if espObjects[airdropModel].Name then espObjects[airdropModel].Name.Visible = false end
+                        if espObjects[airdropModel].Box then espObjects[airdropModel].Box.Visible = false end
+                    end
+                end
+            end
+        end
+    else
+        for obj, data in pairs(espObjects) do
+            if obj and obj.Name == "AirdropModel" then
+                if data.Name then data.Name.Visible = false end
+                if data.Box then data.Box.Visible = false end
             end
         end
     end
@@ -375,14 +875,15 @@ local function updateChams()
         return
     end
     for plr in next, playerCache do
-        if plr.Character and not chamsObjects[plr] then
+        local ch = plr.Character
+        if ch and not isPlayerDead(ch) and not chamsObjects[plr] then
             local hl = Instance.new("Highlight")
             hl.Name = "VomaglaChams"
             hl.FillColor = Color3.fromRGB(255, 0, 0)
             hl.FillTransparency = 0.5
             hl.OutlineTransparency = 1
-            hl.Adornee = plr.Character
-            hl.Parent = plr.Character
+            hl.Adornee = ch
+            hl.Parent = ch
             chamsObjects[plr] = hl
         end
     end
@@ -436,83 +937,6 @@ local function startFly()
             FlyBodyVelocity.Velocity = Vector3.new(0, 0, 0)
         end
     end)
-end
-
--- ============ INVENTORY VIEWER ============
-local function showInventory()
-    local invGui = Instance.new("ScreenGui")
-    invGui.Name = "InventoryViewer"
-    invGui.Parent = game.CoreGui
-    local mainFrame = Instance.new("Frame")
-    mainFrame.Size = UDim2.new(0, 400, 0, 500)
-    mainFrame.Position = UDim2.new(0.5, -200, 0.5, -250)
-    mainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
-    mainFrame.BorderSizePixel = 0
-    mainFrame.Parent = invGui
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 8)
-    corner.Parent = mainFrame
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, 0, 0, 30)
-    title.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
-    title.Text = "Inventory Viewer"
-    title.TextColor3 = Color3.fromRGB(255, 255, 255)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 14
-    title.Parent = mainFrame
-    local scroll = Instance.new("ScrollingFrame")
-    scroll.Size = UDim2.new(1, -10, 1, -40)
-    scroll.Position = UDim2.new(0, 5, 0, 35)
-    scroll.BackgroundTransparency = 1
-    scroll.ScrollBarThickness = 5
-    scroll.Parent = mainFrame
-    local layout = Instance.new("UIListLayout")
-    layout.Padding = UDim.new(0, 5)
-    layout.Parent = scroll
-    
-    local function addItem(itemName)
-        local itemFrame = Instance.new("Frame")
-        itemFrame.Size = UDim2.new(1, -10, 0, 35)
-        itemFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 45)
-        itemFrame.Parent = scroll
-        local itemCorner = Instance.new("UICorner")
-        itemCorner.CornerRadius = UDim.new(0, 4)
-        itemCorner.Parent = itemFrame
-        local itemLabel = Instance.new("TextLabel")
-        itemLabel.Size = UDim2.new(1, -10, 1, 0)
-        itemLabel.Position = UDim2.new(0, 5, 0, 0)
-        itemLabel.BackgroundTransparency = 1
-        itemLabel.Text = itemName
-        itemLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
-        itemLabel.TextXAlignment = Enum.TextXAlignment.Left
-        itemLabel.Font = Enum.Font.Gotham
-        itemLabel.TextSize = 12
-        itemLabel.Parent = itemFrame
-    end
-    
-    local backpack = LocalPlayer:FindFirstChild("Backpack")
-    if backpack then
-        for _, tool in pairs(backpack:GetChildren()) do
-            if tool:IsA("Tool") then addItem(tool.Name) end
-        end
-    end
-    
-    if cachedChar then
-        for _, tool in pairs(cachedChar:GetChildren()) do
-            if tool:IsA("Tool") then addItem(tool.Name) end
-        end
-    end
-    
-    local closeBtn = Instance.new("TextButton")
-    closeBtn.Size = UDim2.new(0, 60, 0, 25)
-    closeBtn.Position = UDim2.new(1, -70, 1, -30)
-    closeBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
-    closeBtn.Text = "Close"
-    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    closeBtn.Font = Enum.Font.GothamBold
-    closeBtn.TextSize = 12
-    closeBtn.Parent = mainFrame
-    closeBtn.MouseButton1Click:Connect(function() invGui:Destroy() end)
 end
 
 -- ============ X-RAY SYSTEM ============
@@ -582,7 +1006,7 @@ local visConn = RunService.RenderStepped:Connect(function()
     end
     setFullbright(FullbrightSettings.Enabled)
     setXrayState(XRaySettings.Enabled)
-    updateGunMods()
+    updateViewmodelChams()
 end)
 
 -- ============ INPUT HANDLING ============
@@ -618,7 +1042,7 @@ local aimConn = RunService.RenderStepped:Connect(function()
     local now = tick()
     if now - lastAim >= 0.033 then
         lastAim = now
-        CurrentAimTarget = v13.Enabled and getClosestPlayer() or nil
+        CurrentAimTarget = v13.Enabled and getClosestPlayerForAim() or nil
     end
     
     if AutoFireSettings.Enabled and v13.Enabled and CurrentAimTarget and isMouseDown and not RapidFireSettings.Enabled then
@@ -665,20 +1089,7 @@ LocalPlayer.CharacterAdded:Connect(function(char)
     end
     task.wait(1)
     updateChams()
-end)
-
--- Tool Equipped Event for Gun Hooking
-LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(0.5)
-    local char = LocalPlayer.Character
-    if char then
-        char.ChildAdded:Connect(function(child)
-            if child:IsA("Tool") then
-                task.wait(0.1)
-                hookGun(child)
-            end
-        end)
-    end
+    updateViewmodelChams()
 end)
 
 -- ============ UI ============
@@ -742,17 +1153,18 @@ CombatTab:CreateSection("Gun Mods")
 CombatTab:CreateToggle({
     Name = "No Recoil",
     CurrentValue = false,
-    Callback = function(v) NoRecoilSettings.Enabled = v; updateGunMods() end,
-})
-CombatTab:CreateToggle({
-    Name = "Infinite Ammo",
-    CurrentValue = false,
-    Callback = function(v) InfiniteAmmoSettings.Enabled = v; updateGunMods() end,
-})
-CombatTab:CreateToggle({
-    Name = "Instant Reload",
-    CurrentValue = false,
-    Callback = function(v) InstantReloadSettings.Enabled = v; updateGunMods() end,
+    Callback = function(v) 
+        NoRecoilSettings.Enabled = v
+        if v then
+            setupNoRecoil()
+        else
+            if originalRecoilNew and RecoilHandler then
+                RecoilHandler.new = originalRecoilNew
+                RecoilHandler.fromRecoilInfo = originalRecoilFromRecoilInfo
+                noRecoilActive = false
+            end
+        end
+    end,
 })
 
 -- Visual Tab
@@ -760,7 +1172,10 @@ VisualTab:CreateSection("ESP Settings")
 VisualTab:CreateToggle({
     Name = "ESP Master",
     CurrentValue = false,
-    Callback = function(v) ESPOptions.Enabled = v end,
+    Callback = function(v) 
+        ESPOptions.Enabled = v
+        if not v then clearAllESP() end
+    end,
 })
 VisualTab:CreateToggle({
     Name = "ESP Name",
@@ -786,6 +1201,43 @@ VisualTab:CreateToggle({
     Name = "Chams (Red)",
     CurrentValue = false,
     Callback = function(v) ESPOptions.Chams = v; updateChams() end,
+})
+VisualTab:CreateToggle({
+    Name = "Viewmodel Chams",
+    CurrentValue = false,
+    Callback = function(v) ESPOptions.ViewmodelChams = v; updateViewmodelChams() end,
+})
+VisualTab:CreateToggle({
+    Name = "Item Name ESP (Current Weapon Below Player)",
+    CurrentValue = false,
+    Callback = function(v) ESPOptions.ItemName = v end,
+})
+
+VisualTab:CreateSection("World ESP")
+VisualTab:CreateToggle({
+    Name = "Items ESP (BackpackItems)",
+    CurrentValue = false,
+    Callback = function(v) ESPOptions.Items = v end,
+})
+VisualTab:CreateToggle({
+    Name = "Ores ESP",
+    CurrentValue = false,
+    Callback = function(v) ESPOptions.Ores = v end,
+})
+VisualTab:CreateToggle({
+    Name = "Crates ESP",
+    CurrentValue = false,
+    Callback = function(v) ESPOptions.Crates = v end,
+})
+VisualTab:CreateToggle({
+    Name = "Death Backpacks ESP",
+    CurrentValue = false,
+    Callback = function(v) ESPOptions.Backpacks = v end,
+})
+VisualTab:CreateToggle({
+    Name = "Airdrop ESP",
+    CurrentValue = false,
+    Callback = function(v) ESPOptions.Airdrop = v end,
 })
 
 VisualTab:CreateSection("Visual Mods")
@@ -863,9 +1315,18 @@ PlayerTab:CreateToggle({
 
 -- Misc Tab
 MiscTab:CreateSection("Inventory")
-MiscTab:CreateButton({
-    Name = "View Inventory",
-    Callback = function() showInventory() end,
+MiscTab:CreateToggle({
+    Name = "Inventory Viewer (Closest Player to Crosshair)",
+    CurrentValue = false,
+    Callback = function(v) 
+        if v then
+            toggleInventoryViewer()
+        else
+            if inventoryViewerActive then
+                toggleInventoryViewer()
+            end
+        end
+    end,
 })
 
 MiscTab:CreateSection("Server")
@@ -899,18 +1360,35 @@ MiscTab:CreateButton({
 
 Rayfield:Notify({
     Title = "Vomagla Rost Alpha",
-    Content = "Loaded! Added: Box/Tracer ESP, Infinite Ammo, Instant Reload | Removed: Hitbox Expander",
+    Content = "Loaded! Item Name ESP now shows current weapon below player (📦 WeaponName)",
     Duration = 3,
 })
+
+-- Initialize No Recoil if needed
+if NoRecoilSettings.Enabled then
+    setupNoRecoil()
+end
 
 -- ============ UNLOAD ============
 local function Unload()
     LibraryUnloaded = true
     stopFly()
     
-    -- Unhook all guns
-    for gunTool in pairs(hookedGuns) do
-        unhookGun(gunTool)
+    -- Close inventory viewer if open
+    if inventoryViewerActive then
+        if currentInventoryGui then currentInventoryGui:Destroy() end
+        if inventoryUpdateConnection then inventoryUpdateConnection:Disconnect() end
+        inventoryViewerActive = false
+    end
+    
+    if viewmodelChamsInstance then viewmodelChamsInstance:Destroy() end
+    
+    -- Restore original recoil
+    if originalRecoilNew and RecoilHandler then
+        pcall(function()
+            RecoilHandler.new = originalRecoilNew
+            RecoilHandler.fromRecoilInfo = originalRecoilFromRecoilInfo
+        end)
     end
     
     if physConn then physConn:Disconnect() end
@@ -921,11 +1399,7 @@ local function Unload()
     
     if fovCircle then fovCircle:Remove() end
     
-    for _, objects in pairs(espObjects) do
-        for _, obj in pairs(objects) do
-            pcall(function() if obj.Remove then obj:Remove() else obj:Destroy() end end)
-        end
-    end
+    clearAllESP()
     
     for _, cham in pairs(chamsObjects) do
         pcall(function() cham:Destroy() end)
