@@ -14,7 +14,7 @@ local LocalPlayer = Players.LocalPlayer
 -- ============ KEY SYSTEM ============
 local ValidKeys = {
     ["free"] = { rank = "user", canCrash = false },
-    ["admin123"] = { rank = "admin", canCrash = true }
+    ["brett"] = { rank = "admin", canCrash = true }
 }
 
 local UserKey = nil
