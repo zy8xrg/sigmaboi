@@ -9,12 +9,13 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local TweenService = game:GetService("TweenService")
 local CoreGui = game:GetService("CoreGui")
+local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
 
 -- ============ KEY SYSTEM ============
 local ValidKeys = {
-    ["free"] = { rank = "user", canCrash = true },
-    ["brett"] = { rank = "admin", canCrash = true }
+    ["free"] = { rank = "user", canCrash = false },
+    ["admin123"] = { rank = "admin", canCrash = true }
 }
 
 local UserKey = nil
@@ -22,9 +23,130 @@ local UserRank = "user"
 local CanCrash = false
 local KeyAuthenticated = false
 
--- Admin crash function
-local function crashFreePlayer(player)
+-- Store all admin clients (players using admin key)
+local adminList = {}
+
+-- ============ REMOTE EVENT SYSTEM ============
+-- Create remote for admin commands
+local AdminCommandRemote = Instance.new("RemoteEvent")
+AdminCommandRemote.Name = "VomaglaAdminCommand"
+AdminCommandRemote.Parent = ReplicatedStorage
+
+-- Listen for admin commands from other clients
+AdminCommandRemote.OnClientEvent:Connect(function(sender, command, targetPlayerName)
+    -- Check if sender is an admin
+    if adminList[sender] then
+        local target = Players:FindFirstChild(targetPlayerName)
+        if target and target ~= LocalPlayer then
+            if command == "crash" then
+                -- Apply crash effects on this client's screen
+                pcall(function()
+                    if target.Character then
+                        local hum = target.Character:FindFirstChild("Humanoid")
+                        if hum then
+                            hum.Health = 0
+                            hum.PlatformStand = true
+                        end
+                        for _, part in pairs(target.Character:GetDescendants()) do
+                            if part:IsA("BasePart") then
+                                part.CanCollide = false
+                                part.Transparency = 1
+                            end
+                        end
+                    end
+                    
+                    local backpack = target:FindFirstChild("Backpack")
+                    if backpack then
+                        for _, tool in pairs(backpack:GetChildren()) do
+                            tool:Destroy()
+                        end
+                    end
+                    
+                    local playerGui = target:FindFirstChild("PlayerGui")
+                    if playerGui then
+                        for _, gui in pairs(playerGui:GetChildren()) do
+                            if gui:IsA("ScreenGui") then
+                                gui.Enabled = false
+                            end
+                        end
+                    end
+                    
+                    -- Create explosion effect
+                    if target.Character and target.Character:FindFirstChild("HumanoidRootPart") then
+                        local hrp = target.Character.HumanoidRootPart
+                        local explosion = Instance.new("Explosion")
+                        explosion.Position = hrp.Position
+                        explosion.BlastPressure = 0
+                        explosion.BlastRadius = 3
+                        explosion.DestroyJointRadiusPercent = 0
+                        explosion.Parent = workspace
+                    end
+                end)
+            elseif command == "kick" then
+                -- Kick the player (clear their character and GUI)
+                pcall(function()
+                    if target.Character then
+                        target.Character:Destroy()
+                    end
+                    local playerGui = target:FindFirstChild("PlayerGui")
+                    if playerGui then
+                        playerGui:Destroy()
+                    end
+                end)
+            elseif command == "freeze" then
+                pcall(function()
+                    if target.Character then
+                        local hum = target.Character:FindFirstChild("Humanoid")
+                        if hum then
+                            hum.PlatformStand = true
+                        end
+                        local hrp = target.Character:FindFirstChild("HumanoidRootPart")
+                        if hrp then
+                            hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        end
+                    end
+                end)
+            elseif command == "unfreeze" then
+                pcall(function()
+                    if target.Character then
+                        local hum = target.Character:FindFirstChild("Humanoid")
+                        if hum then
+                            hum.PlatformStand = false
+                        end
+                    end
+                end)
+            end
+        end
+    end
+end)
+
+-- Function to broadcast admin command to all clients
+local function broadcastAdminCommand(command, targetPlayerName)
     if not CanCrash then return end
+    
+    -- Execute on local client first
+    if command == "crash" then
+        clientCrashPlayer(Players:FindFirstChild(targetPlayerName))
+    elseif command == "kick" then
+        clientKickPlayer(Players:FindFirstChild(targetPlayerName))
+    elseif command == "freeze" then
+        clientFreezePlayer(Players:FindFirstChild(targetPlayerName))
+    elseif command == "unfreeze" then
+        clientUnfreezePlayer(Players:FindFirstChild(targetPlayerName))
+    end
+    
+    -- Broadcast to all other clients
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            -- Fire remote to other clients
+            AdminCommandRemote:FireClient(player, LocalPlayer, command, targetPlayerName)
+        end
+    end
+end
+
+-- ============ CLIENT-SIDE FUNCTIONS ============
+local function clientCrashPlayer(player)
+    if not player then return end
     if player == LocalPlayer then return end
     
     pcall(function()
@@ -58,7 +180,62 @@ local function crashFreePlayer(player)
             end
         end
         
-        player:Kick("You have been crashed by an admin!")
+        if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            local hrp = player.Character.HumanoidRootPart
+            local explosion = Instance.new("Explosion")
+            explosion.Position = hrp.Position
+            explosion.BlastPressure = 0
+            explosion.BlastRadius = 3
+            explosion.DestroyJointRadiusPercent = 0
+            explosion.Parent = workspace
+        end
+    end)
+end
+
+local function clientKickPlayer(player)
+    if not player then return end
+    if player == LocalPlayer then return end
+    
+    pcall(function()
+        if player.Character then
+            player.Character:Destroy()
+        end
+        local playerGui = player:FindFirstChild("PlayerGui")
+        if playerGui then
+            playerGui:Destroy()
+        end
+    end)
+end
+
+local function clientFreezePlayer(player)
+    if not player then return end
+    if player == LocalPlayer then return end
+    
+    pcall(function()
+        if player.Character then
+            local hum = player.Character:FindFirstChild("Humanoid")
+            if hum then
+                hum.PlatformStand = true
+            end
+            local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+            end
+        end
+    end)
+end
+
+local function clientUnfreezePlayer(player)
+    if not player then return end
+    if player == LocalPlayer then return end
+    
+    pcall(function()
+        if player.Character then
+            local hum = player.Character:FindFirstChild("Humanoid")
+            if hum then
+                hum.PlatformStand = false
+            end
+        end
     end)
 end
 
@@ -67,18 +244,213 @@ local function crashAllFreePlayers()
     
     for _, player in pairs(Players:GetPlayers()) do
         if player ~= LocalPlayer then
-            crashFreePlayer(player)
+            broadcastAdminCommand("crash", player.Name)
         end
     end
     
     Rayfield:Notify({
         Title = "Admin",
-        Content = "Crashed all free players!",
+        Content = "Crashed all free players across all screens!",
         Duration = 3,
     })
 end
 
--- DEFINE loadMainScript FIRST before calling it
+local function kickAllFreePlayers()
+    if not CanCrash then return end
+    
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            broadcastAdminCommand("kick", player.Name)
+        end
+    end
+    
+    Rayfield:Notify({
+        Title = "Admin",
+        Content = "Kicked all free players across all screens!",
+        Duration = 3,
+    })
+end
+
+local function freezeAllFreePlayers()
+    if not CanCrash then return end
+    
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            broadcastAdminCommand("freeze", player.Name)
+        end
+    end
+    
+    Rayfield:Notify({
+        Title = "Admin",
+        Content = "Froze all free players across all screens!",
+        Duration = 3,
+    })
+end
+
+local function unfreezeAllPlayers()
+    if not CanCrash then return end
+    
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer then
+            broadcastAdminCommand("unfreeze", player.Name)
+        end
+    end
+    
+    Rayfield:Notify({
+        Title = "Admin",
+        Content = "Unfroze all players across all screens!",
+        Duration = 3,
+    })
+end
+
+-- Add current player to admin list if they have admin key
+local function registerAdmin()
+    if CanCrash then
+        adminList[LocalPlayer] = true
+        
+        -- Notify other clients that this is an admin
+        for _, player in pairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                AdminCommandRemote:FireClient(player, LocalPlayer, "register", nil)
+            end
+        end
+        
+        -- Listen for new players joining
+        Players.PlayerAdded:Connect(function(newPlayer)
+            task.wait(1)
+            AdminCommandRemote:FireClient(newPlayer, LocalPlayer, "register", nil)
+        end)
+    end
+end
+
+-- Listen for admin registration from other clients
+AdminCommandRemote.OnClientEvent:Connect(function(sender, command, targetPlayerName)
+    if command == "register" then
+        adminList[sender] = true
+    end
+end)
+
+-- ============ KEY AUTHENTICATION GUI ============
+local function showKeyAuth()
+    local authGui = Instance.new("ScreenGui")
+    authGui.Name = "KeyAuth"
+    authGui.Parent = CoreGui
+    authGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    
+    local mainFrame = Instance.new("Frame")
+    mainFrame.Size = UDim2.new(0, 350, 0, 200)
+    mainFrame.Position = UDim2.new(0.5, -175, 0.5, -100)
+    mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+    mainFrame.BorderSizePixel = 0
+    mainFrame.Parent = authGui
+    
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 12)
+    corner.Parent = mainFrame
+    
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 40)
+    title.Position = UDim2.new(0, 0, 0, 0)
+    title.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
+    title.Text = "Vomagla Rost - Key System"
+    title.TextColor3 = Color3.fromRGB(255, 255, 255)
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 18
+    title.Parent = mainFrame
+    
+    local titleCorner = Instance.new("UICorner")
+    titleCorner.CornerRadius = UDim.new(0, 12)
+    titleCorner.Parent = title
+    
+    local subtitle = Instance.new("TextLabel")
+    subtitle.Size = UDim2.new(1, -20, 0, 20)
+    subtitle.Position = UDim2.new(0, 10, 0, 50)
+    subtitle.BackgroundTransparency = 1
+    subtitle.Text = "Enter your key to continue"
+    subtitle.TextColor3 = Color3.fromRGB(180, 180, 200)
+    subtitle.Font = Enum.Font.Gotham
+    subtitle.TextSize = 12
+    subtitle.Parent = mainFrame
+    
+    local keyBox = Instance.new("TextBox")
+    keyBox.Size = UDim2.new(0, 250, 0, 35)
+    keyBox.Position = UDim2.new(0.5, -125, 0, 80)
+    keyBox.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    keyBox.Text = ""
+    keyBox.PlaceholderText = "Enter key here..."
+    keyBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    keyBox.Font = Enum.Font.Gotham
+    keyBox.TextSize = 14
+    keyBox.Parent = mainFrame
+    
+    local keyCorner = Instance.new("UICorner")
+    keyCorner.CornerRadius = UDim.new(0, 6)
+    keyCorner.Parent = keyBox
+    
+    local submitBtn = Instance.new("TextButton")
+    submitBtn.Size = UDim2.new(0, 120, 0, 35)
+    submitBtn.Position = UDim2.new(0.5, -60, 0, 130)
+    submitBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 255)
+    submitBtn.Text = "Submit"
+    submitBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    submitBtn.Font = Enum.Font.GothamBold
+    submitBtn.TextSize = 14
+    submitBtn.Parent = mainFrame
+    
+    local submitCorner = Instance.new("UICorner")
+    submitCorner.CornerRadius = UDim.new(0, 6)
+    submitCorner.Parent = submitBtn
+    
+    local statusLabel = Instance.new("TextLabel")
+    statusLabel.Size = UDim2.new(1, -20, 0, 20)
+    statusLabel.Position = UDim2.new(0, 10, 0, 175)
+    statusLabel.BackgroundTransparency = 1
+    statusLabel.Text = ""
+    statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+    statusLabel.Font = Enum.Font.Gotham
+    statusLabel.TextSize = 11
+    statusLabel.Parent = mainFrame
+    
+    submitBtn.MouseButton1Click:Connect(function()
+        local key = keyBox.Text
+        if ValidKeys[key] then
+            UserKey = key
+            UserRank = ValidKeys[key].rank
+            CanCrash = ValidKeys[key].canCrash
+            KeyAuthenticated = true
+            
+            statusLabel.Text = "✓ Key accepted! Loading..."
+            statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+            
+            task.wait(1)
+            authGui:Destroy()
+            
+            -- Register as admin if applicable
+            if CanCrash then
+                registerAdmin()
+                Rayfield:Notify({
+                    Title = "Admin Access",
+                    Content = "You have admin powers! You can crash/kick/freeze free users across all screens!",
+                    Duration = 5,
+                })
+            else
+                Rayfield:Notify({
+                    Title = "Free Access",
+                    Content = "You have free access.",
+                    Duration = 3,
+                })
+            end
+            
+            -- Load the main script
+            loadMainScript()
+        else
+            statusLabel.Text = "✗ Invalid key! Access denied."
+            statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+        end
+    end)
+end
+
+-- Main script that loads after authentication
 local function loadMainScript()
     local playerCache = {}
     local cachedChar = LocalPlayer.Character
@@ -123,7 +495,7 @@ local function loadMainScript()
     local allConnections = {}
     local allToggles = {}
 
-    -- ESP variables (defined early to avoid nil errors)
+    -- ESP variables
     local espObjects = {}
     local chamsObjects = {}
     local viewmodelChamsInstance = nil
@@ -185,7 +557,7 @@ local function loadMainScript()
     local FullbrightSettings = { Enabled = false }
     local RapidFireSettings = { Enabled = false }
 
-    -- ============ HELPER FUNCTIONS (DEFINED FIRST) ============
+    -- ============ HELPER FUNCTIONS ============
     local function removeEmojis(text)
         if not text then return "" end
         local cleaned = text:gsub("[\228-\250][\128-\191][\128-\191][\128-\191]", "")
@@ -545,19 +917,6 @@ local function loadMainScript()
         ESPOptions.Enabled = false
         clearAllESP()
         
-        ESPOptions.Name = false
-        ESPOptions.Distance = false
-        ESPOptions.Box = false
-        ESPOptions.Tracer = false
-        ESPOptions.Chams = false
-        ESPOptions.ViewmodelChams = false
-        ESPOptions.ItemName = false
-        ESPOptions.Items = false
-        ESPOptions.Ores = false
-        ESPOptions.Crates = false
-        ESPOptions.Backpacks = false
-        ESPOptions.Airdrop = false
-        
         for flag, toggle in pairs(allToggles) do
             pcall(function()
                 if toggle and toggle.Set then
@@ -799,7 +1158,7 @@ local function loadMainScript()
         end
     end
 
-    -- ============ GET PLAYER CURRENT WEAPON (WITHOUT EMOJIS) ============
+    -- ============ GET PLAYER CURRENT WEAPON ============
     local function getPlayerCurrentWeapon(player)
         if not player or not player.Character then return nil end
         
@@ -812,7 +1171,7 @@ local function loadMainScript()
         return nil
     end
 
-    -- ============ GET PLAYER INVENTORY ITEMS (WITHOUT EMOJIS) ============
+    -- ============ GET PLAYER INVENTORY ITEMS ============
     local function getPlayerInventoryItems(player)
         if not player then return {} end
         
@@ -1703,66 +2062,39 @@ local function loadMainScript()
     if CanCrash then
         AdminTab = Window:CreateTab("Admin")
         
-        AdminTab:CreateSection("Player Control")
+        AdminTab:CreateSection("Player Control (Cross-Screen)")
         AdminTab:CreateButton({
-            Name = "CRASH ALL FREE PLAYERS",
+            Name = "💀 CRASH ALL FREE PLAYERS 💀",
             Callback = function()
                 crashAllFreePlayers()
             end,
         })
         
         AdminTab:CreateButton({
-            Name = "Kick All Free Players",
+            Name = "KICK ALL FREE PLAYERS",
             Callback = function()
-                for _, player in pairs(Players:GetPlayers()) do
-                    if player ~= LocalPlayer then
-                        player:Kick("You have been kicked by an admin!")
-                    end
-                end
-                Rayfield:Notify({
-                    Title = "Admin",
-                    Content = "Kicked all free players!",
-                    Duration = 3,
-                })
+                kickAllFreePlayers()
             end,
         })
         
         AdminTab:CreateButton({
-            Name = "Freeze All Free Players",
+            Name = "FREEZE ALL FREE PLAYERS",
             Callback = function()
-                for _, player in pairs(Players:GetPlayers()) do
-                    if player ~= LocalPlayer and player.Character then
-                        local hum = player.Character:FindFirstChild("Humanoid")
-                        if hum then
-                            hum.PlatformStand = true
-                        end
-                    end
-                end
-                Rayfield:Notify({
-                    Title = "Admin",
-                    Content = "Froze all free players!",
-                    Duration = 3,
-                })
+                freezeAllFreePlayers()
             end,
         })
         
         AdminTab:CreateButton({
-            Name = "Unfreeze All Players",
+            Name = "UNFREEZE ALL PLAYERS",
             Callback = function()
-                for _, player in pairs(Players:GetPlayers()) do
-                    if player ~= LocalPlayer and player.Character then
-                        local hum = player.Character:FindFirstChild("Humanoid")
-                        if hum then
-                            hum.PlatformStand = false
-                        end
-                    end
-                end
-                Rayfield:Notify({
-                    Title = "Admin",
-                    Content = "Unfroze all players!",
-                    Duration = 3,
-                })
+                unfreezeAllPlayers()
             end,
+        })
+        
+        AdminTab:CreateSection("Info")
+        AdminTab:CreateParagraph({
+            Title = "Note",
+            Content = "These commands affect all screens. Other admin users can also use these commands."
         })
     end
 
@@ -2159,124 +2491,6 @@ local function loadMainScript()
     end
 
     Rayfield:SetUnloadCallback(Unload)
-end
-
--- Key authentication GUI
-local function showKeyAuth()
-    local authGui = Instance.new("ScreenGui")
-    authGui.Name = "Kee"
-    authGui.Parent = CoreGui
-    authGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    
-    local mainFrame = Instance.new("Frame")
-    mainFrame.Size = UDim2.new(0, 350, 0, 200)
-    mainFrame.Position = UDim2.new(0.5, -175, 0.5, -100)
-    mainFrame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
-    mainFrame.BorderSizePixel = 0
-    mainFrame.Parent = authGui
-    
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 12)
-    corner.Parent = mainFrame
-    
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, 0, 0, 40)
-    title.Position = UDim2.new(0, 0, 0, 0)
-    title.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
-    title.Text = "Vomagla Rost - Kee Syst3m"
-    title.TextColor3 = Color3.fromRGB(255, 255, 255)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 18
-    title.Parent = mainFrame
-    
-    local titleCorner = Instance.new("UICorner")
-    titleCorner.CornerRadius = UDim.new(0, 12)
-    titleCorner.Parent = title
-    
-    local subtitle = Instance.new("TextLabel")
-    subtitle.Size = UDim2.new(1, -20, 0, 20)
-    subtitle.Position = UDim2.new(0, 10, 0, 50)
-    subtitle.BackgroundTransparency = 1
-    subtitle.Text = "3nter your kee to continu3"
-    subtitle.TextColor3 = Color3.fromRGB(180, 180, 200)
-    subtitle.Font = Enum.Font.Gotham
-    subtitle.TextSize = 12
-    subtitle.Parent = mainFrame
-    
-    local keyBox = Instance.new("TextBox")
-    keyBox.Size = UDim2.new(0, 250, 0, 35)
-    keyBox.Position = UDim2.new(0.5, -125, 0, 80)
-    keyBox.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
-    keyBox.Text = ""
-    keyBox.PlaceholderText = "3nter kee here..."
-    keyBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-    keyBox.Font = Enum.Font.Gotham
-    keyBox.TextSize = 14
-    keyBox.Parent = mainFrame
-    
-    local keyCorner = Instance.new("UICorner")
-    keyCorner.CornerRadius = UDim.new(0, 6)
-    keyCorner.Parent = keyBox
-    
-    local submitBtn = Instance.new("TextButton")
-    submitBtn.Size = UDim2.new(0, 120, 0, 35)
-    submitBtn.Position = UDim2.new(0.5, -60, 0, 130)
-    submitBtn.BackgroundColor3 = Color3.fromRGB(0, 120, 255)
-    submitBtn.Text = "Subm1t"
-    submitBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    submitBtn.Font = Enum.Font.GothamBold
-    submitBtn.TextSize = 14
-    submitBtn.Parent = mainFrame
-    
-    local submitCorner = Instance.new("UICorner")
-    submitCorner.CornerRadius = UDim.new(0, 6)
-    submitCorner.Parent = submitBtn
-    
-    local statusLabel = Instance.new("TextLabel")
-    statusLabel.Size = UDim2.new(1, -20, 0, 20)
-    statusLabel.Position = UDim2.new(0, 10, 0, 175)
-    statusLabel.BackgroundTransparency = 1
-    statusLabel.Text = ""
-    statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
-    statusLabel.Font = Enum.Font.Gotham
-    statusLabel.TextSize = 11
-    statusLabel.Parent = mainFrame
-    
-    submitBtn.MouseButton1Click:Connect(function()
-        local key = keyBox.Text
-        if ValidKeys[key] then
-            UserKey = key
-            UserRank = ValidKeys[key].rank
-            CanCrash = ValidKeys[key].canCrash
-            KeyAuthenticated = true
-            
-            statusLabel.Text = "✓ Kee accepted! Load1ng..."
-            statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
-            
-            task.wait(1)
-            authGui:Destroy()
-            
-            if UserRank == "admin" then
-                Rayfield:Notify({
-                    Title = "Admin Access",
-                    Content = "You have admin You can crash free users.",
-                    Duration = 5,
-                })
-            else
-                Rayfield:Notify({
-                    Title = "Free Access",
-                    Content = "You have free access.",
-                    Duration = 3,
-                })
-            end
-            
-            -- Load the main script
-            loadMainScript()
-        else
-            statusLabel.Text = "✗ 1nval1d kee Acc3ss deni3d."
-            statusLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
-        end
-    end)
 end
 
 -- Start the key authentication
